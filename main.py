@@ -1592,12 +1592,4 @@ def game(date: str, game: str) -> None:
 # ---------------------------------------------------------------------------
 
 if __name__ in {"__main__", "__mp_main__"}:
-    import os
-    port = int(os.environ.get("PORT", 8080))
-    ui.run(
-        host="0.0.0.0",
-        port=port,
-        title="NBA Betting AI",
-        favicon="static/icon.png",
-        reload=False
-    )
+    ui.run(title="NBA Betting AI", favicon="static/icon.png", reload=False)
