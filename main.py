@@ -47,17 +47,18 @@ def power_de_vig_scalar(h_implied, a_implied, max_iter=100, tol=1e-12):
     """
     Remove the overround from a pair of implied probabilities using
     the power (multiplicative) method.
-    Returns (fair_home, fair_away) such that fair_home + fair_away = 1.
-    Falls back to proportional method if convergence fails.
+    Returns (fair_home, fair_away, method) where method describes
+    which algorithm was used (converged Newton, bisection fallback,
+    or proportional fallback).
     """
     h = float(h_implied)
     a = float(a_implied)
     if np.isnan(h) or np.isnan(a) or h <= 0 or a <= 0:
-        return np.nan, np.nan
+        return np.nan, np.nan, "invalid"
 
     # Already sum to 1 within tolerance
     if abs(h + a - 1.0) < tol:
-        return h, a
+        return h, a, "already fair"
 
     def f(k):
         return h ** k + a ** k - 1.0
@@ -69,11 +70,11 @@ def power_de_vig_scalar(h_implied, a_implied, max_iter=100, tol=1e-12):
 
     # Initial guess: k < 1 because overround > 1
     k = 1.0
-    converged = False
+    newton_converged = False
     for _ in range(max_iter):
         fk = f(k)
         if abs(fk) < tol:
-            converged = True
+            newton_converged = True
             break
         fpk = fp(k)
         if fpk == 0:
@@ -85,34 +86,42 @@ def power_de_vig_scalar(h_implied, a_implied, max_iter=100, tol=1e-12):
             k_new = 10.0
         if abs(k_new - k) < tol:
             k = k_new
-            converged = True
+            newton_converged = True
             break
         k = k_new
 
-    if not converged:
-        # Bisection fallback
-        lo, hi = 0.001, 1.0
-        if f(lo) < 0:
-            lo, hi = hi, lo
-        for _ in range(max_iter):
-            mid = (lo + hi) / 2
-            if f(mid) == 0.0 or (hi - lo) / 2 < tol:
-                k = mid
-                converged = True
-                break
-            if np.sign(f(mid)) == np.sign(f(lo)):
-                lo = mid
-            else:
-                hi = mid
+    if newton_converged:
+        fair_home = h ** k
+        fair_away = a ** k
+        return fair_home, fair_away, "power (converged)"
 
-    if not converged:
-        # Ultimate fallback: proportional method
-        total = h + a
-        return h / total if total > 0 else np.nan, a / total if total > 0 else np.nan
+    # Bisection fallback
+    lo, hi = 0.001, 1.0
+    if f(lo) < 0:
+        lo, hi = hi, lo
+    bisection_converged = False
+    for _ in range(max_iter):
+        mid = (lo + hi) / 2
+        if f(mid) == 0.0 or (hi - lo) / 2 < tol:
+            k = mid
+            bisection_converged = True
+            break
+        if np.sign(f(mid)) == np.sign(f(lo)):
+            lo = mid
+        else:
+            hi = mid
 
-    fair_home = h ** k
-    fair_away = a ** k
-    return fair_home, fair_away
+    if bisection_converged:
+        fair_home = h ** k
+        fair_away = a ** k
+        return fair_home, fair_away, "bisection fallback"
+
+    # Ultimate fallback: proportional method
+    total = h + a
+    if total > 0:
+        return h / total, a / total, "proportional fallback"
+    else:
+        return np.nan, np.nan, "proportional fallback (invalid)"
 
 
 # ---------------------------------------------------------------------------
@@ -397,17 +406,26 @@ def feature_engineering_inference(df: pd.DataFrame) -> pd.DataFrame:
 
     # -----------------------------------------------------------------------
     # DE‑VIG THE INPUT ODDS: power method (same as simulation)
+    # Also record which de‑vig method was used for each row.
     # -----------------------------------------------------------------------
     col_home = "home_moneyline_implied_prob"
     col_away = "away_moneyline_implied_prob"
+    de_vig_methods = []
     both_valid = df[col_home].notna() & df[col_away].notna()
     if both_valid.any():
         for i in df[both_valid].index:
             h = df.at[i, col_home]
             a = df.at[i, col_away]
-            fair_h, fair_a = power_de_vig_scalar(h, a)
+            fair_h, fair_a, method = power_de_vig_scalar(h, a)
             df.at[i, col_home] = fair_h
             df.at[i, col_away] = fair_a
+            de_vig_methods.append(method)
+        # For rows where not both valid, fill with None
+        for i in df[~both_valid].index:
+            de_vig_methods.append(None)
+    else:
+        de_vig_methods = [None] * len(df)
+    df["de_vig_method"] = de_vig_methods
     # -----------------------------------------------------------------------
 
     req = ("home_moneyline_implied_prob", "away_moneyline_implied_prob")
@@ -670,14 +688,14 @@ def build_game_data_for_date(date: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Public prediction function
+# Public prediction function (now returns de‑vig method as third value)
 # ---------------------------------------------------------------------------
 
 def predict_game_proba(
     game_data: dict,
     manual_home_ml: str = "",
     manual_away_ml: str = "",
-) -> tuple[float, float]:
+) -> tuple[float, float, str | None]:
     try:
         df = pd.DataFrame([game_data])
 
@@ -688,6 +706,9 @@ def predict_game_proba(
 
         df = feature_engineering_inference(df)
 
+        # Extract the de‑vig method from the DataFrame
+        de_vig_method = df.iloc[0].get("de_vig_method") if len(df) > 0 else None
+
         for col in df.columns:
             if col.startswith(("home_", "away_")) and col not in [
                 "home_team",
@@ -697,17 +718,17 @@ def predict_game_proba(
             ]:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        drop_cols = ["home_team", "away_team", "date", "winner", "home_prob", "away_prob"]
+        drop_cols = ["home_team", "away_team", "date", "winner", "home_prob", "away_prob", "de_vig_method"]
         df_features = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
 
         x = _prepare_model_input(df_features)
         proba = model.predict_proba(x)[0]
-        return round(float(proba[0]) * 100, 1), round(float(proba[1]) * 100, 1)
+        return round(float(proba[0]) * 100, 1), round(float(proba[1]) * 100, 1), de_vig_method
 
     except Exception as e:
         print(f"Prediction error: {e}")
         traceback.print_exc()
-        return 50.0, 50.0
+        return 50.0, 50.0, None
 
 
 # ---------------------------------------------------------------------------
@@ -726,7 +747,7 @@ def _binned_kelly_bet(
     Edge is computed against power‑de‑vigged fair probabilities.
     side: 'home' or 'away'.
     Bins:
-      3.5% ≤ edge < 5.5%  →  1.0 × Kelly (full Kelly)
+      2.5% ≤ edge < 5.5%  →  1.0 × Kelly (full Kelly)
       edge ≥ 5.5%         →  0.25 × Kelly
     """
     if not moneyline_str or not moneyline_str.strip():
@@ -739,12 +760,12 @@ def _binned_kelly_bet(
     if np.isnan(implied) or np.isnan(opposing_implied) or implied <= 0 or opposing_implied <= 0:
         return None
 
-    # De‑vig the pair using the power method
+    # De‑vig the pair using the power method (ignore method string here)
     if side == "home":
-        fair_home, fair_away = power_de_vig_scalar(implied, opposing_implied)
+        fair_home, fair_away, _ = power_de_vig_scalar(implied, opposing_implied)
         fair_prob = fair_home
     else:  # side == "away"
-        fair_home, fair_away = power_de_vig_scalar(opposing_implied, implied)
+        fair_home, fair_away, _ = power_de_vig_scalar(opposing_implied, implied)
         fair_prob = fair_away
 
     if np.isnan(fair_prob):
@@ -766,7 +787,7 @@ def _binned_kelly_bet(
     if f < 0:
         f = 0.0
 
-    has_edge = edge_pct >= 3.5    # <-- changed from 4.0 to 3.5
+    has_edge = edge_pct >= 2.5    # <-- changed from 3.5 to 2.5
     if has_edge:
         if edge_pct < 5.5:
             kelly_fraction = 1.0
@@ -807,6 +828,7 @@ class GameCard(ui.card):
         )
         self.home_prob: float | None = None
         self.away_prob: float | None = None
+        self.de_vig_method: str | None = None
         self.status_message = "Enter both moneylines to calculate win probabilities."
 
         self.classes("m-4 p-8 rounded-2xl shadow-md border w-[720px]").style(
@@ -967,6 +989,7 @@ class GameCard(ui.card):
         data = dict(self.game)
         data["home_prob"] = self.home_prob
         data["away_prob"] = self.away_prob
+        data["de_vig_method"] = self.de_vig_method
         data["home_moneyline"] = self.home_ml_input.value.strip() if self.home_ml_input.value else ""
         data["away_moneyline"] = self.away_ml_input.value.strip() if self.away_ml_input.value else ""
         return to_json_safe_dict(data)
@@ -1011,6 +1034,13 @@ class GameCard(ui.card):
                 with ui.row().classes("w-full justify-center mt-2"):
                     ui.label(f"Vig: {vig_pct:+.2f}%").classes(
                         "text-sm font-bold text-orange-800 bg-yellow-100 px-2 py-1 rounded"
+                    )
+
+            # De‑vig method display
+            if self.de_vig_method:
+                with ui.row().classes("w-full justify-center mt-1"):
+                    ui.label(f"De‑vig method: {self.de_vig_method}").classes(
+                        "text-xs text-blue-800 bg-blue-100 px-2 py-0.5 rounded"
                     )
 
             self._render_edge_section()
@@ -1063,7 +1093,7 @@ class GameCard(ui.card):
                         mult = home_res["kelly_multiplier"]
                         ui.label(f"Bet (Kelly {mult:.2f}×): ${home_res['bet_amount']:.2f}").classes("text-xs font-semibold")
                     else:
-                        reason = "No bet (vig > 6.5%)" if vig_too_high else "No bet (edge <3.5%)"
+                        reason = "No bet (vig > 6.5%)" if vig_too_high else "No bet (edge <2.5%)"
                         ui.label(reason).classes("text-xs text-grey-7")
             else:
                 with ui.column(align_items="start").classes("bg-grey-3 rounded p-2 flex-1"):
@@ -1082,7 +1112,7 @@ class GameCard(ui.card):
                         mult = away_res["kelly_multiplier"]
                         ui.label(f"Bet (Kelly {mult:.2f}×): ${away_res['bet_amount']:.2f}").classes("text-xs font-semibold")
                     else:
-                        reason = "No bet (vig > 6.5%)" if vig_too_high else "No bet (edge <3.5%)"
+                        reason = "No bet (vig > 6.5%)" if vig_too_high else "No bet (edge <2.5%)"
                         ui.label(reason).classes("text-xs text-grey-7")
             else:
                 with ui.column(align_items="end").classes("bg-grey-3 rounded p-2 flex-1"):
@@ -1094,7 +1124,7 @@ class GameCard(ui.card):
         active_away = away_res["has_edge"] if away_res and away_res["has_edge"] else None
         if active_home or active_away:
             with ui.row().classes("w-full justify-center mt-1"):
-                ui.label("Kelly bins: 3.5-5.5%→1.0×, ≥5.5%→0.25×").classes("text-xs text-grey-6")
+                ui.label("Kelly bins: 2.5-5.5%→1.0×, ≥5.5%→0.25×").classes("text-xs text-grey-6")
 
     def calculate_prediction(self) -> None:
         home_ml = self.home_ml_input.value.strip() if self.home_ml_input.value else ""
@@ -1103,6 +1133,7 @@ class GameCard(ui.card):
         if not home_ml or not away_ml:
             self.home_prob = None
             self.away_prob = None
+            self.de_vig_method = None
             self.status_message = "Enter both moneylines to calculate win probabilities."
             self.render_prediction_panel.refresh()
             return
@@ -1110,13 +1141,15 @@ class GameCard(ui.card):
         if not valid_moneylines(home_ml, away_ml):
             self.home_prob = None
             self.away_prob = None
+            self.de_vig_method = None
             self.status_message = "Enter valid moneylines like -150 and +130."
             self.render_prediction_panel.refresh()
             return
 
-        hp, ap = predict_game_proba(self.game, home_ml, away_ml)
+        hp, ap, method = predict_game_proba(self.game, home_ml, away_ml)
         self.home_prob = hp
         self.away_prob = ap
+        self.de_vig_method = method
         self.game["home_moneyline"] = home_ml
         self.game["away_moneyline"] = away_ml
         self.game["home_prob"] = hp
@@ -1356,6 +1389,7 @@ def game(date: str, game: str) -> None:
         detail_state = {
             "home_prob": game_data.get("home_prob"),
             "away_prob": game_data.get("away_prob"),
+            "de_vig_method": game_data.get("de_vig_method"),
             "status": "Enter both moneylines to calculate win probabilities."
             if game_data.get("home_prob") is None or game_data.get("away_prob") is None
             else "",
@@ -1433,6 +1467,13 @@ def game(date: str, game: str) -> None:
                             "text-sm font-bold text-orange-800 bg-yellow-100 px-2 py-1 rounded"
                         )
 
+                # De‑vig method display
+                if detail_state.get("de_vig_method"):
+                    with ui.row().classes("w-full justify-center mt-1"):
+                        ui.label(f"De‑vig method: {detail_state['de_vig_method']}").classes(
+                            "text-xs text-blue-800 bg-blue-100 px-2 py-0.5 rounded"
+                        )
+
                 _render_detail_edge()
 
         def _render_detail_edge() -> None:
@@ -1482,7 +1523,7 @@ def game(date: str, game: str) -> None:
                             mult = home_res["kelly_multiplier"]
                             ui.label(f"Bet (Kelly {mult:.2f}×): ${home_res['bet_amount']:.2f}").classes("text-xs font-semibold")
                         else:
-                            reason = "No bet (vig > 6.5%)" if vig_too_high else "No bet (edge <3.5%)"
+                            reason = "No bet (vig > 6.5%)" if vig_too_high else "No bet (edge <2.5%)"
                             ui.label(reason).classes("text-xs text-grey-7")
                 else:
                     with ui.column(align_items="start").classes("bg-grey-3 rounded p-2 flex-1"):
@@ -1501,7 +1542,7 @@ def game(date: str, game: str) -> None:
                             mult = away_res["kelly_multiplier"]
                             ui.label(f"Bet (Kelly {mult:.2f}×): ${away_res['bet_amount']:.2f}").classes("text-xs font-semibold")
                         else:
-                            reason = "No bet (vig > 6.5%)" if vig_too_high else "No bet (edge <3.5%)"
+                            reason = "No bet (vig > 6.5%)" if vig_too_high else "No bet (edge <2.5%)"
                             ui.label(reason).classes("text-xs text-grey-7")
                 else:
                     with ui.column(align_items="end").classes("bg-grey-3 rounded p-2 flex-1"):
@@ -1510,7 +1551,7 @@ def game(date: str, game: str) -> None:
 
             if (home_res and home_res["has_edge"]) or (away_res and away_res["has_edge"]):
                 with ui.row().classes("w-full justify-center mt-1"):
-                    ui.label("Kelly bins: 3.5-5.5%→1.0×, ≥5.5%→0.25×").classes("text-xs text-grey-6")
+                    ui.label("Kelly bins: 2.5-5.5%→1.0×, ≥5.5%→0.25×").classes("text-xs text-grey-6")
 
         def calculate_detail_prediction() -> None:
             home_ml = home_ml_input.value.strip() if home_ml_input.value else ""
@@ -1519,6 +1560,7 @@ def game(date: str, game: str) -> None:
             if not home_ml or not away_ml:
                 detail_state["home_prob"] = None
                 detail_state["away_prob"] = None
+                detail_state["de_vig_method"] = None
                 detail_state["status"] = "Enter both moneylines to calculate win probabilities."
                 render_detail_prediction.refresh()
                 return
@@ -1526,18 +1568,21 @@ def game(date: str, game: str) -> None:
             if not valid_moneylines(home_ml, away_ml):
                 detail_state["home_prob"] = None
                 detail_state["away_prob"] = None
+                detail_state["de_vig_method"] = None
                 detail_state["status"] = "Enter valid moneylines like -150 and +130."
                 render_detail_prediction.refresh()
                 return
 
-            hp, ap = predict_game_proba(game_data, home_ml, away_ml)
+            hp, ap, method = predict_game_proba(game_data, home_ml, away_ml)
             detail_state["home_prob"] = hp
             detail_state["away_prob"] = ap
+            detail_state["de_vig_method"] = method
             detail_state["status"] = ""
             game_data["home_moneyline"] = home_ml
             game_data["away_moneyline"] = away_ml
             game_data["home_prob"] = hp
             game_data["away_prob"] = ap
+            game_data["de_vig_method"] = method
             render_detail_prediction.refresh()
 
         with ui.row().classes("w-full justify-center mt-2"):
