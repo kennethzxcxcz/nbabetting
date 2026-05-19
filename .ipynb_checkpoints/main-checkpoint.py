@@ -32,11 +32,11 @@ stats_tags: list[str] = []
 # ---------------------------------------------------------------------------
 # Bankroll and Kelly settings
 # ---------------------------------------------------------------------------
-BANKROLL: float = 1000.0          # user bankroll in dollars
+BANKROLL: float = 75.0          # user bankroll in dollars
 # ---------------------------------------------------------------------------
 # Odds format selector (American / Decimal / Polymarket shares)
 # ---------------------------------------------------------------------------
-ODDS_FORMAT: str = "decimal"   # options: "american", "decimal", "shares"
+ODDS_FORMAT: str = "shares"   # options: "american", "decimal", "shares"
 
 
 # ---------------------------------------------------------------------------
