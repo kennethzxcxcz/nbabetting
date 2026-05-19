@@ -1,8 +1,0 @@
-streamlit
-feedparser
-pandas
-beautifulsoup4
-google-genai
-Pillow
-requests
-tenacity
