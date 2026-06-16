@@ -32,7 +32,7 @@ stats_tags: list[str] = []
 # ---------------------------------------------------------------------------
 # Bankroll and Kelly settings
 # ---------------------------------------------------------------------------
-BANKROLL: float = 75.0          # user bankroll in dollars
+BANKROLL: float = 00.0          # user bankroll in dollars
 # ---------------------------------------------------------------------------
 # Odds format selector (American / Decimal / Polymarket shares)
 # ---------------------------------------------------------------------------
@@ -253,7 +253,7 @@ def load_model_bundle(model_path: str = "./model/nba.pkl") -> None:
 
 
 # ---------------------------------------------------------------------------
-# Feature engineering (inference)
+# Feature engineering (inference) – NO DE‑VIGGING, raw vigged odds used
 # ---------------------------------------------------------------------------
 
 def parse_moneyline_to_implied_prob(ml_str: str) -> float:
@@ -318,6 +318,9 @@ def feature_engineering_inference(df: pd.DataFrame) -> pd.DataFrame:
         if col not in df.columns:
             df[col] = np.nan
         df[f"{col}_implied_prob"] = df[col].apply(parse_moneyline_to_implied_prob)
+
+    # NO DE‑VIGGING – raw implied probabilities are kept as‑is
+    # -----------------------------------------------------------------------
 
     req = ("home_moneyline_implied_prob", "away_moneyline_implied_prob")
     if all(c in df.columns for c in req):
@@ -579,7 +582,7 @@ def build_game_data_for_date(date: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Public prediction function
+# Public prediction function (raw vigged odds, no de‑vig)
 # ---------------------------------------------------------------------------
 
 def predict_game_proba(
@@ -620,7 +623,7 @@ def predict_game_proba(
 
 
 # ---------------------------------------------------------------------------
-# Edge & Kelly calculation (two‑bin strategy)
+# Edge & Kelly calculation (two‑bin strategy) – raw vigged odds, no de‑vig
 # ---------------------------------------------------------------------------
 
 def _binned_kelly_bet(
@@ -632,7 +635,7 @@ def _binned_kelly_bet(
 ) -> dict | None:
     """
     Compute edge and bet amount using two‑bin Kelly strategy.
-    Edge is computed against raw implied probabilities.
+    Edge is computed against raw (vigged) implied probability.
     side: 'home' or 'away'.
     Bins:
       2.5% ≤ edge < 5.5%  →  1.0 × Kelly (full Kelly)
@@ -644,17 +647,12 @@ def _binned_kelly_bet(
         return None
 
     implied = parse_moneyline_to_implied_prob(moneyline_str)
-    opposing_implied = parse_moneyline_to_implied_prob(opposing_moneyline_str)
-    if np.isnan(implied) or np.isnan(opposing_implied) or implied <= 0 or opposing_implied <= 0:
-        return None
-
-    fair_prob = implied
-
-    if np.isnan(fair_prob):
+    if np.isnan(implied) or implied <= 0:
         return None
 
     p = predicted_prob_pct / 100.0
-    edge = p - fair_prob
+    # edge = model prob - raw implied prob (with vig)
+    edge = p - implied
     edge_pct = edge * 100
     decimal_odds = 1.0 / implied if implied > 0 else 0.0
 
@@ -669,7 +667,7 @@ def _binned_kelly_bet(
     if f < 0:
         f = 0.0
 
-    has_edge = edge_pct >= 2.5
+    has_edge = edge_pct >= 2.4
     if has_edge:
         if edge_pct < 5.5:
             kelly_fraction = 1.0
@@ -874,6 +872,161 @@ class GameCard(ui.card):
         data["away_moneyline"] = self.away_ml_input.value.strip() if self.away_ml_input.value else ""
         return to_json_safe_dict(data)
 
+    def _compute_sensitivity_predictions(self) -> list[dict]:
+        """
+        Only called when odds format is 'shares' and inputs are valid.
+        Returns a list of dicts with keys:
+            home_odds, away_odds, home_prob, away_prob,
+            home_edge, away_edge, home_bet, away_bet, vig_too_high
+        """
+        home_str = self.home_ml_input.value.strip()
+        away_str = self.away_ml_input.value.strip()
+
+        try:
+            base_home = float(home_str)
+            base_away = float(away_str)
+        except ValueError:
+            return []
+
+        # ±0.01 and ±0.02 perturbations (5 inferences total)
+        perturbations = [
+            (base_home + 0.02, base_away - 0.02),
+            (base_home + 0.01, base_away - 0.01),
+            (base_home - 0.01, base_away + 0.01),
+            (base_home - 0.02, base_away + 0.02),
+        ]
+
+        results = []
+        # Original first
+        hp, ap = predict_game_proba(self.game, home_str, away_str)
+        kelly_home = _binned_kelly_bet(hp, home_str, away_str, "home", BANKROLL)
+        kelly_away = _binned_kelly_bet(ap, away_str, home_str, "away", BANKROLL)
+
+        # Vig check for original
+        home_imp = parse_moneyline_to_implied_prob(home_str)
+        away_imp = parse_moneyline_to_implied_prob(away_str)
+        vig_pct = (home_imp + away_imp - 1) * 100 if not np.isnan(home_imp) and not np.isnan(away_imp) else None
+        vig_high = vig_pct is not None and vig_pct > 6.5
+        if vig_high:
+            if kelly_home: kelly_home["bet_amount"] = 0.0
+            if kelly_away: kelly_away["bet_amount"] = 0.0
+
+        results.append({
+            "home_odds": home_str,
+            "away_odds": away_str,
+            "home_prob": hp,
+            "away_prob": ap,
+            "home_edge": kelly_home["edge_pct"] if kelly_home else None,
+            "away_edge": kelly_away["edge_pct"] if kelly_away else None,
+            "home_bet": kelly_home["bet_amount"] if kelly_home else None,
+            "away_bet": kelly_away["bet_amount"] if kelly_away else None,
+            "vig_too_high": vig_high,
+        })
+
+        for h_val, a_val in perturbations:
+            h_val = round(max(0.01, min(0.99, h_val)), 2)
+            a_val = round(max(0.01, min(0.99, a_val)), 2)
+            h_str_p = f"{h_val:.2f}"
+            a_str_p = f"{a_val:.2f}"
+
+            hp, ap = predict_game_proba(self.game, h_str_p, a_str_p)
+            k_home = _binned_kelly_bet(hp, h_str_p, a_str_p, "home", BANKROLL)
+            k_away = _binned_kelly_bet(ap, a_str_p, h_str_p, "away", BANKROLL)
+
+            # Vig check for this perturbation
+            home_imp = parse_moneyline_to_implied_prob(h_str_p)
+            away_imp = parse_moneyline_to_implied_prob(a_str_p)
+            vig_pct_p = (home_imp + away_imp - 1) * 100 if not np.isnan(home_imp) and not np.isnan(away_imp) else None
+            vig_high_p = vig_pct_p is not None and vig_pct_p > 6.5
+            if vig_high_p:
+                if k_home: k_home["bet_amount"] = 0.0
+                if k_away: k_away["bet_amount"] = 0.0
+
+            results.append({
+                "home_odds": h_str_p,
+                "away_odds": a_str_p,
+                "home_prob": hp,
+                "away_prob": ap,
+                "home_edge": k_home["edge_pct"] if k_home else None,
+                "away_edge": k_away["edge_pct"] if k_away else None,
+                "home_bet": k_home["bet_amount"] if k_home else None,
+                "away_bet": k_away["bet_amount"] if k_away else None,
+                "vig_too_high": vig_high_p,
+            })
+
+        return results
+
+    @ui.refreshable
+    def render_sensitivity_table(self) -> None:
+        """Show sensitivity table only when format is shares and inputs are valid."""
+        home_ml = self.home_ml_input.value.strip()
+        away_ml = self.away_ml_input.value.strip()
+
+        if ODDS_FORMAT != "shares" or not home_ml or not away_ml:
+            return
+
+        try:
+            float(home_ml)
+            float(away_ml)
+        except ValueError:
+            return
+
+        sensitivity_data = self._compute_sensitivity_predictions()
+        # Now expecting exactly 5 rows: original + 4 perturbations
+        if not sensitivity_data or len(sensitivity_data) < 5:
+            return
+
+        with ui.column().classes("w-full mt-4 items-center"):
+            ui.label("Sensitivity Analysis (Polymarket shares)").classes("font-bold text-sm text-grey-8 mb-1")
+            with ui.element("div").classes("bg-white rounded-lg p-2 shadow-inner w-full overflow-auto"):
+                # Table header
+                with ui.row().classes("w-full font-bold text-xs text-grey-7 mb-1"):
+                    ui.label("Home Odds").classes("flex-1 text-center")
+                    ui.label("Away Odds").classes("flex-1 text-center")
+                    ui.label("Home Win%").classes("flex-1 text-center")
+                    ui.label("Away Win%").classes("flex-1 text-center")
+                    ui.label("Home Edge").classes("flex-1 text-center")
+                    ui.label("Away Edge").classes("flex-1 text-center")
+                    ui.label("Home Bet").classes("flex-1 text-center")
+                    ui.label("Away Bet").classes("flex-1 text-center")
+
+                for entry in sensitivity_data:
+                    row_style = "text-red-100 bg-red-300" if entry["vig_too_high"] else ""
+
+                    # Determine bet cell colour
+                    home_bet_val = entry["home_bet"]
+                    away_bet_val = entry["away_bet"]
+                    home_bet_class = "flex-1 text-center font-semibold " + (
+                        "text-green-600" if (home_bet_val is not None and home_bet_val > 0) else "text-red-600"
+                    )
+                    away_bet_class = "flex-1 text-center font-semibold " + (
+                        "text-green-600" if (away_bet_val is not None and away_bet_val > 0) else "text-red-600"
+                    )
+
+                    with ui.row().classes(f"w-full text-xs py-1 {row_style}"):
+                        ui.label(entry["home_odds"]).classes("flex-1 text-center")
+                        ui.label(entry["away_odds"]).classes("flex-1 text-center")
+                        ui.label(f"{entry['home_prob']:.1f}%").classes("flex-1 text-center font-semibold")
+                        ui.label(f"{entry['away_prob']:.1f}%").classes("flex-1 text-center font-semibold")
+                        ui.label(
+                            f"{entry['home_edge']:.2f}%" if entry["home_edge"] is not None else "—"
+                        ).classes("flex-1 text-center")
+                        ui.label(
+                            f"{entry['away_edge']:.2f}%" if entry["away_edge"] is not None else "—"
+                        ).classes("flex-1 text-center")
+                        ui.label(
+                            f"${home_bet_val:.2f}" if home_bet_val is not None else "—"
+                        ).classes(home_bet_class)
+                        ui.label(
+                            f"${away_bet_val:.2f}" if away_bet_val is not None else "—"
+                        ).classes(away_bet_class)
+
+                if any(e["vig_too_high"] for e in sensitivity_data):
+                    with ui.row().classes("w-full justify-center mt-1"):
+                        ui.label("⚠️ Vig > 6.5% on highlighted rows → bet forced to $0.00").classes(
+                            "text-xs text-red-700 bg-red-100 px-2 py-0.5 rounded"
+                        )
+
     @ui.refreshable
     def render_prediction_panel(self) -> None:
         if self.home_prob is None or self.away_prob is None:
@@ -917,6 +1070,9 @@ class GameCard(ui.card):
                     )
 
             self._render_edge_section()
+
+            # Sensitivity table (only appears when format = shares)
+            self.render_sensitivity_table()
 
     def _render_edge_section(self) -> None:
         home_ml = self.game.get("home_moneyline", "")
@@ -1264,7 +1420,6 @@ def game(date: str, game: str) -> None:
             else "",
         }
 
-        # Placeholder based on current format
         home_ph = {
             "american": "e.g. -150",
             "decimal": "e.g. 2.50",
@@ -1337,12 +1492,144 @@ def game(date: str, game: str) -> None:
                         )
 
                 _render_detail_edge()
+                _render_detail_sensitivity()
+
+        def _render_detail_sensitivity() -> None:
+            home_ml = home_ml_input.value.strip()
+            away_ml = away_ml_input.value.strip()
+
+            if ODDS_FORMAT != "shares" or not home_ml or not away_ml:
+                return
+
+            try:
+                float(home_ml)
+                float(away_ml)
+            except ValueError:
+                return
+
+            try:
+                base_home = float(home_ml)
+                base_away = float(away_ml)
+            except ValueError:
+                return
+
+            # ±0.01 and ±0.02 perturbations (5 inferences total)
+            perturbations = [
+                (base_home + 0.02, base_away - 0.02),
+                (base_home + 0.01, base_away - 0.01),
+                (base_home - 0.01, base_away + 0.01),
+                (base_home - 0.02, base_away + 0.02),
+            ]
+
+            results = []
+            # Original
+            hp, ap = predict_game_proba(game_data, home_ml, away_ml)
+            k_home = _binned_kelly_bet(hp, home_ml, away_ml, "home", BANKROLL)
+            k_away = _binned_kelly_bet(ap, away_ml, home_ml, "away", BANKROLL)
+            h_imp = parse_moneyline_to_implied_prob(home_ml)
+            a_imp = parse_moneyline_to_implied_prob(away_ml)
+            vig_p = (h_imp + a_imp - 1)*100 if not np.isnan(h_imp) and not np.isnan(a_imp) else None
+            vig_high = vig_p is not None and vig_p > 6.5
+            if vig_high:
+                if k_home: k_home["bet_amount"] = 0.0
+                if k_away: k_away["bet_amount"] = 0.0
+
+            results.append({
+                "home_odds": home_ml,
+                "away_odds": away_ml,
+                "home_prob": hp,
+                "away_prob": ap,
+                "home_edge": k_home["edge_pct"] if k_home else None,
+                "away_edge": k_away["edge_pct"] if k_away else None,
+                "home_bet": k_home["bet_amount"] if k_home else None,
+                "away_bet": k_away["bet_amount"] if k_away else None,
+                "vig_too_high": vig_high,
+            })
+
+            for h_val, a_val in perturbations:
+                h_val = round(max(0.01, min(0.99, h_val)), 2)
+                a_val = round(max(0.01, min(0.99, a_val)), 2)
+                h_str = f"{h_val:.2f}"
+                a_str = f"{a_val:.2f}"
+                hp, ap = predict_game_proba(game_data, h_str, a_str)
+                k_home = _binned_kelly_bet(hp, h_str, a_str, "home", BANKROLL)
+                k_away = _binned_kelly_bet(ap, a_str, h_str, "away", BANKROLL)
+                h_imp = parse_moneyline_to_implied_prob(h_str)
+                a_imp = parse_moneyline_to_implied_prob(a_str)
+                vig_p = (h_imp + a_imp - 1)*100 if not np.isnan(h_imp) and not np.isnan(a_imp) else None
+                vig_high_p = vig_p is not None and vig_p > 6.5
+                if vig_high_p:
+                    if k_home: k_home["bet_amount"] = 0.0
+                    if k_away: k_away["bet_amount"] = 0.0
+                results.append({
+                    "home_odds": h_str,
+                    "away_odds": a_str,
+                    "home_prob": hp,
+                    "away_prob": ap,
+                    "home_edge": k_home["edge_pct"] if k_home else None,
+                    "away_edge": k_away["edge_pct"] if k_away else None,
+                    "home_bet": k_home["bet_amount"] if k_home else None,
+                    "away_bet": k_away["bet_amount"] if k_away else None,
+                    "vig_too_high": vig_high_p,
+                })
+
+            if len(results) < 5:
+                return
+
+            with ui.column().classes("w-full mt-4 items-center"):
+                ui.label("Sensitivity Analysis (Polymarket shares)").classes("font-bold text-sm text-grey-8 mb-1")
+                with ui.element("div").classes("bg-white rounded-lg p-2 shadow-inner w-full overflow-auto"):
+                    with ui.row().classes("w-full font-bold text-xs text-grey-7 mb-1"):
+                        ui.label("Home Odds").classes("flex-1 text-center")
+                        ui.label("Away Odds").classes("flex-1 text-center")
+                        ui.label("Home Win%").classes("flex-1 text-center")
+                        ui.label("Away Win%").classes("flex-1 text-center")
+                        ui.label("Home Edge").classes("flex-1 text-center")
+                        ui.label("Away Edge").classes("flex-1 text-center")
+                        ui.label("Home Bet").classes("flex-1 text-center")
+                        ui.label("Away Bet").classes("flex-1 text-center")
+
+                    for entry in results:
+                        row_style = "text-red-100 bg-red-300" if entry["vig_too_high"] else ""
+
+                        # Determine bet cell colour
+                        home_bet_val = entry["home_bet"]
+                        away_bet_val = entry["away_bet"]
+                        home_bet_class = "flex-1 text-center font-semibold " + (
+                            "text-green-600" if (home_bet_val is not None and home_bet_val > 0) else "text-red-600"
+                        )
+                        away_bet_class = "flex-1 text-center font-semibold " + (
+                            "text-green-600" if (away_bet_val is not None and away_bet_val > 0) else "text-red-600"
+                        )
+
+                        with ui.row().classes(f"w-full text-xs py-1 {row_style}"):
+                            ui.label(entry["home_odds"]).classes("flex-1 text-center")
+                            ui.label(entry["away_odds"]).classes("flex-1 text-center")
+                            ui.label(f"{entry['home_prob']:.1f}%").classes("flex-1 text-center font-semibold")
+                            ui.label(f"{entry['away_prob']:.1f}%").classes("flex-1 text-center font-semibold")
+                            ui.label(
+                                f"{entry['home_edge']:.2f}%" if entry["home_edge"] is not None else "—"
+                            ).classes("flex-1 text-center")
+                            ui.label(
+                                f"{entry['away_edge']:.2f}%" if entry["away_edge"] is not None else "—"
+                            ).classes("flex-1 text-center")
+                            ui.label(
+                                f"${home_bet_val:.2f}" if home_bet_val is not None else "—"
+                            ).classes(home_bet_class)
+                            ui.label(
+                                f"${away_bet_val:.2f}" if away_bet_val is not None else "—"
+                            ).classes(away_bet_class)
+
+                    if any(e["vig_too_high"] for e in results):
+                        with ui.row().classes("w-full justify-center mt-1"):
+                            ui.label("⚠️ Vig > 6.5% on highlighted rows → bet forced to $0.00").classes(
+                                "text-xs text-red-700 bg-red-100 px-2 py-0.5 rounded"
+                            )
 
         def _render_detail_edge() -> None:
             hm = home_ml_input.value.strip() if home_ml_input.value else ""
             aw = away_ml_input.value.strip() if away_ml_input.value else ""
 
-            # ----- vig for betting disallow rule -----
             vig_pct = None
             if hm and aw:
                 home_imp = parse_moneyline_to_implied_prob(hm)
